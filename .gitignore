@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# Swift Package Manager
+.build/
+.swiftpm/
+/.swiftpm/xcode/
+
+# Xcode
+DerivedData/
+*.xcworkspace/
+*.xcuserstate
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+
+# Build artifacts
+*.app
+*.dSYM
+*.dSYM.zip
+*.ipa
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Local env / editor
+.env
+.env.*
+.idea/
+.vscode/
+.claude/
+
+# Runtime artifacts (defensive)
+debug.log

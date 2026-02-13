@@ -1,0 +1,47 @@
+name: ClipMaster CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Test and Build (macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Swift Version
+        run: swift --version
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Resolve Dependencies
+        run: swift package resolve
+
+      - name: Run Tests
+        run: swift test
+
+      - name: Build Release App
+        run: bash build.sh
+
+      - name: Upload App Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipMaster.app
+          path: .build/release/ClipMaster.app
+          if-no-files-found: error
+          retention-days: 14
