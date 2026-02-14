@@ -1,10 +1,11 @@
 import AppKit
 import SwiftUI
 import Carbon.HIToolbox
+import ApplicationServices
 
 /// Controls the floating quick-paste panel lifecycle and keyboard input.
-/// The panel never steals focus — the user's active app stays in front.
-/// Keyboard events are intercepted via CGEvent tap so arrow keys work.
+/// The panel normally does not steal focus — the user's active app stays in front.
+/// When secure input is enabled, it falls back to focused keyboard mode.
 final class FloatingPanelController {
     static let shared = FloatingPanelController()
 
@@ -14,7 +15,12 @@ final class FloatingPanelController {
     private var allItems: [ClipboardItem] = []
     private var searchText = ""
     private var listVersion = 0
+    private var keyboardInputAvailable = true
+    private var protectedInputRestricted = false
     private var clickMonitor: Any?
+    private var localKeyMonitor: Any?
+    private var secureInputMode = false
+    private var frontmostAppBeforePanel: NSRunningApplication?
     private var searchWorkItem: DispatchWorkItem?
     private var searchRequestID = UUID()
 
@@ -35,7 +41,7 @@ final class FloatingPanelController {
     }
 
     func show() {
-        dismiss()
+        dismiss(restoreFocus: false)
 
         guard let loaded = try? StorageService.shared.fetchAll(limit: maxVisibleItems), !loaded.isEmpty else {
             return
@@ -50,16 +56,49 @@ final class FloatingPanelController {
         let panel = FloatingPanel()
         self.panel = panel
 
-        // Show at cursor position
-        panel.show(with: makeView())
+        let frontmostBeforePanel = NSWorkspace.shared.frontmostApplication
+        let restrictedMode = isRestrictedProtectedInputMode(frontmostApp: frontmostBeforePanel)
+        protectedInputRestricted = restrictedMode
 
-        // Install CGEvent tap for keyboard interception
-        let tapInstalled = panel.installEventTap { [weak self] cgEvent in
-            guard let self else { return false }
-            return self.handleCGEvent(cgEvent)
+        let focusedKeyboardMode = !restrictedMode && shouldUseFocusedKeyboardMode(frontmostApp: frontmostBeforePanel)
+        secureInputMode = focusedKeyboardMode
+        frontmostAppBeforePanel = focusedKeyboardMode ? frontmostBeforePanel : nil
+        panel.setKeyboardCaptureEnabled(focusedKeyboardMode)
+
+        if restrictedMode {
+            keyboardInputAvailable = false
+            AppLogger.ui.notice("Quick paste restricted in protected password input; click-to-copy fallback active")
+        } else if focusedKeyboardMode {
+            AppLogger.ui.notice("Quick paste switched to focused keyboard mode for protected input compatibility")
         }
-        if !tapInstalled {
-            AppLogger.ui.error("Quick paste event tap install failed; keyboard shortcuts unavailable")
+
+        // Show at cursor position
+        panel.show(with: makeView(), activateApp: focusedKeyboardMode)
+
+        if restrictedMode {
+            panel.setLocalKeyHandler(nil)
+        } else if focusedKeyboardMode {
+            panel.setLocalKeyHandler { [weak self] event in
+                guard let self else { return false }
+                return self.handleNSEvent(event)
+            }
+            keyboardInputAvailable = installLocalKeyboardMonitor()
+            if !keyboardInputAvailable {
+                AppLogger.ui.error("Quick paste local keyboard monitor install failed in secure input mode")
+                panel.updateContent(with: makeView())
+            }
+        } else {
+            panel.setLocalKeyHandler(nil)
+            // Install CGEvent tap for keyboard interception
+            let tapInstalled = panel.installEventTap { [weak self] cgEvent in
+                guard let self else { return false }
+                return self.handleCGEvent(cgEvent)
+            }
+            keyboardInputAvailable = tapInstalled
+            if !tapInstalled {
+                AppLogger.ui.error("Quick paste event tap install failed; keyboard shortcuts unavailable")
+                panel.updateContent(with: makeView())
+            }
         }
 
         // Dismiss on click outside
@@ -75,7 +114,14 @@ final class FloatingPanelController {
         }
     }
 
-    func dismiss() {
+    func dismiss(restoreFocus: Bool = true) {
+        if restoreFocus,
+           secureInputMode,
+           let targetApp = frontmostAppBeforePanel,
+           !targetApp.isTerminated {
+            targetApp.activate(options: [.activateIgnoringOtherApps])
+        }
+
         searchWorkItem?.cancel()
         searchWorkItem = nil
         searchRequestID = UUID()
@@ -86,9 +132,17 @@ final class FloatingPanelController {
         selectedIndex = 0
         searchText = ""
         listVersion = 0
+        keyboardInputAvailable = true
+        protectedInputRestricted = false
+        secureInputMode = false
+        frontmostAppBeforePanel = nil
         if let monitor = clickMonitor {
             NSEvent.removeMonitor(monitor)
             clickMonitor = nil
+        }
+        if let monitor = localKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            localKeyMonitor = nil
         }
     }
 
@@ -108,7 +162,19 @@ final class FloatingPanelController {
     private func handleCGEventOnMain(_ cgEvent: CGEvent) -> Bool {
         let keyCode = Int(cgEvent.getIntegerValueField(.keyboardEventKeycode))
         let flags = cgEvent.flags
+        return handleKeyInput(keyCode: keyCode, flags: flags, printableInput: unicodeInput(from: cgEvent))
+    }
 
+    private func handleNSEvent(_ event: NSEvent) -> Bool {
+        let keyCode = Int(event.keyCode)
+        let flags = cgEventFlags(from: event.modifierFlags)
+        if keyCode == kVK_UpArrow || keyCode == kVK_DownArrow || keyCode == kVK_Return {
+            AppLogger.ui.debug("Focused mode keyDown keyCode=\(keyCode) flags=\(String(describing: flags), privacy: .public)")
+        }
+        return handleKeyInput(keyCode: keyCode, flags: flags, printableInput: event.characters)
+    }
+
+    private func handleKeyInput(keyCode: Int, flags: CGEventFlags, printableInput: String?) -> Bool {
         // Escape — clear search or dismiss
         if keyCode == kVK_Escape {
             if !searchText.isEmpty {
@@ -134,14 +200,10 @@ final class FloatingPanelController {
             itemCount: items.count
         ) {
             let item = items[selectedIndex]
-            dismiss()
-            // Delay paste slightly so the panel has time to close
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                if pasteMode == .plainText {
-                    PasteService.pastePlainText(item)
-                } else {
-                    PasteService.paste(item)
-                }
+            if protectedInputRestricted {
+                copyForRestrictedInput(item)
+            } else {
+                performPaste(item, plainText: pasteMode == .plainText)
             }
             return true
         } else if keyCode == kVK_Return {
@@ -215,9 +277,10 @@ final class FloatingPanelController {
             ]
             if let index = numberKeyMap[keyCode], index < items.count {
                 let item = items[index]
-                dismiss()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    PasteService.paste(item)
+                if protectedInputRestricted {
+                    copyForRestrictedInput(item)
+                } else {
+                    performPaste(item)
                 }
                 return true
             }
@@ -226,21 +289,140 @@ final class FloatingPanelController {
         // Printable character input — append to search
         let noActionModifiers = flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty
         if noActionModifiers {
-            var length = 0
-            var chars = [UniChar](repeating: 0, count: 4)
-            cgEvent.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &length, unicodeString: &chars)
-            if length > 0 {
-                let str = String(utf16CodeUnits: chars, count: length)
-                if !str.isEmpty && str.rangeOfCharacter(from: .controlCharacters) == nil {
-                    searchText += str
-                    refreshView()
-                    applySearch(debounced: true)
-                    return true
-                }
+            if let str = printableInput,
+               !str.isEmpty,
+               str.rangeOfCharacter(from: .controlCharacters) == nil {
+                searchText += str
+                refreshView()
+                applySearch(debounced: true)
+                return true
             }
         }
 
         return false
+    }
+
+    private func unicodeInput(from event: CGEvent) -> String? {
+        var length = 0
+        var chars = [UniChar](repeating: 0, count: 4)
+        event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &length, unicodeString: &chars)
+        guard length > 0 else { return nil }
+        return String(utf16CodeUnits: chars, count: length)
+    }
+
+    private func cgEventFlags(from flags: NSEvent.ModifierFlags) -> CGEventFlags {
+        var result: CGEventFlags = []
+        if flags.contains(.command) { result.insert(.maskCommand) }
+        if flags.contains(.shift) { result.insert(.maskShift) }
+        if flags.contains(.option) { result.insert(.maskAlternate) }
+        if flags.contains(.control) { result.insert(.maskControl) }
+        return result
+    }
+
+    private func installLocalKeyboardMonitor() -> Bool {
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleNSEvent(event) ? nil : event
+        }
+        return localKeyMonitor != nil
+    }
+
+    private func shouldUseFocusedKeyboardMode(frontmostApp: NSRunningApplication?) -> Bool {
+        if isKnownProtectedInputApp(frontmostApp) { return false }
+        if IsSecureEventInputEnabled() { return true }
+        return isFocusedElementSecureTextInput(frontmostApp)
+    }
+
+    private func isRestrictedProtectedInputMode(frontmostApp: NSRunningApplication?) -> Bool {
+        guard isKnownProtectedInputApp(frontmostApp) else { return false }
+        if IsSecureEventInputEnabled() { return true }
+        return isFocusedElementSecureTextInput(frontmostApp)
+    }
+
+    private func isKnownProtectedInputApp(_ app: NSRunningApplication?) -> Bool {
+        let bundle = app?.bundleIdentifier?.lowercased() ?? ""
+        let name = app?.localizedName?.lowercased() ?? ""
+        return bundle.contains("chatbox") || name.contains("chatbox")
+    }
+
+    private func isFocusedElementSecureTextInput(_ app: NSRunningApplication?) -> Bool {
+        guard let app else { return false }
+        guard SystemPermissionService.isAccessibilityGranted() else { return false }
+
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedValue: CFTypeRef?
+        let focusedResult = AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        )
+        guard focusedResult == .success, let focusedValue else { return false }
+        guard CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else { return false }
+
+        let focusedElement = unsafeBitCast(focusedValue, to: AXUIElement.self)
+
+        var subroleValue: CFTypeRef?
+        let subroleResult = AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXSubroleAttribute as CFString,
+            &subroleValue
+        )
+        if subroleResult == .success,
+           let subrole = subroleValue as? String,
+           subrole == (kAXSecureTextFieldSubrole as String) {
+            return true
+        }
+
+        var roleValue: CFTypeRef?
+        let roleResult = AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXRoleAttribute as CFString,
+            &roleValue
+        )
+        if roleResult == .success,
+           let role = roleValue as? String,
+           role.lowercased().contains("secure") {
+            return true
+        }
+
+        return false
+    }
+
+    private func performPaste(_ item: ClipboardItem, plainText: Bool = false) {
+        let targetApp = secureInputMode ? frontmostAppBeforePanel : nil
+        dismiss(restoreFocus: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            if let targetApp, !targetApp.isTerminated {
+                targetApp.activate(options: [.activateIgnoringOtherApps])
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                if plainText {
+                    PasteService.pastePlainText(item)
+                } else {
+                    PasteService.paste(item)
+                }
+            }
+        }
+    }
+
+    private func copyForRestrictedInput(_ item: ClipboardItem) {
+        let copied = PasteService.writeToPasteboard(item)
+        dismiss(restoreFocus: false)
+        if copied {
+            ToastService.shared.show(
+                message: "已复制：密码隐藏模式请切到可见后粘贴",
+                systemImage: "eye.slash.fill",
+                tintColor: .systemOrange,
+                duration: 1.6
+            )
+        } else {
+            NSSound.beep()
+            ToastService.shared.show(
+                message: "复制失败",
+                systemImage: "xmark.circle.fill",
+                tintColor: .systemRed
+            )
+        }
     }
 
     // MARK: - Search
@@ -321,7 +503,20 @@ final class FloatingPanelController {
             items: items,
             selectedIndex: selectedIndex,
             searchText: searchText,
-            listVersion: listVersion
+            listVersion: listVersion,
+            keyboardInputAvailable: keyboardInputAvailable,
+            protectedInputRestricted: protectedInputRestricted,
+            onItemSelect: { [weak self] index in
+                guard let self else { return }
+                guard index >= 0, index < self.items.count else { return }
+                self.selectedIndex = index
+                let item = self.items[index]
+                if self.protectedInputRestricted {
+                    self.copyForRestrictedInput(item)
+                } else {
+                    self.performPaste(item)
+                }
+            }
         )
     }
 

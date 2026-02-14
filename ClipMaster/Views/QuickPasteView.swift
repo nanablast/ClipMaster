@@ -7,6 +7,9 @@ struct QuickPasteView: View {
     let selectedIndex: Int
     let searchText: String
     let listVersion: Int
+    let keyboardInputAvailable: Bool
+    let protectedInputRestricted: Bool
+    let onItemSelect: (Int) -> Void
 
     private let rowHeight: CGFloat = 44
     private let maxPanelHeight: CGFloat = 420
@@ -56,6 +59,32 @@ struct QuickPasteView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
+            if protectedInputRestricted {
+                HStack(spacing: 6) {
+                    Image(systemName: "eye.slash.fill")
+                        .foregroundStyle(.orange)
+                        .font(.system(size: 10))
+                    Text("密码隐藏模式受限：点击条目复制，切换可见后粘贴")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+            } else if !keyboardInputAvailable {
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(.orange)
+                        .font(.system(size: 10))
+                    Text("当前输入框启用安全输入，请点击条目粘贴")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+            }
+
             if !searchText.isEmpty {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
@@ -92,6 +121,10 @@ struct QuickPasteView: View {
                                     isSelected: selectedIndex == index
                                 )
                                 .id(item.id)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    onItemSelect(index)
+                                }
                             }
                         }
                         .padding(.horizontal, 6)

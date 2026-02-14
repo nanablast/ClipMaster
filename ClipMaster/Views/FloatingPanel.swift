@@ -2,14 +2,16 @@ import AppKit
 import SwiftUI
 
 /// A floating panel that appears at the cursor position without stealing focus.
-/// Uses CGEvent tap to intercept keyboard input before it reaches the frontmost app.
+/// Uses CGEvent tap by default; can switch to focused keyboard capture when needed.
 final class FloatingPanel: NSPanel {
     private var hostingView: NSHostingView<AnyView>?
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var keyHandler: ((CGEvent) -> Bool)?
+    private var localKeyHandler: ((NSEvent) -> Bool)?
     private var initialOrigin: NSPoint?
     private var retainedSelf: Unmanaged<FloatingPanel>?
+    private var keyboardCaptureEnabled = false
 
     init() {
         super.init(
@@ -28,7 +30,20 @@ final class FloatingPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
 
-    func show<Content: View>(with content: Content) {
+    func setKeyboardCaptureEnabled(_ enabled: Bool) {
+        keyboardCaptureEnabled = enabled
+        if enabled {
+            styleMask.remove(.nonactivatingPanel)
+        } else {
+            styleMask.insert(.nonactivatingPanel)
+        }
+    }
+
+    func setLocalKeyHandler(_ handler: ((NSEvent) -> Bool)?) {
+        localKeyHandler = handler
+    }
+
+    func show<Content: View>(with content: Content, activateApp: Bool = false) {
         let hosting = NSHostingView(rootView: AnyView(content))
         hosting.frame.size = hosting.fittingSize
         contentView = hosting
@@ -61,7 +76,14 @@ final class FloatingPanel: NSPanel {
 
         initialOrigin = origin
         setFrame(NSRect(origin: origin, size: panelSize), display: true)
-        orderFrontRegardless()
+        if activateApp {
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+            NSApp.activate(ignoringOtherApps: true)
+            makeKeyAndOrderFront(nil)
+            makeFirstResponder(contentView)
+        } else {
+            orderFrontRegardless()
+        }
     }
 
     func updateContent<Content: View>(with content: Content) {
@@ -167,8 +189,18 @@ final class FloatingPanel: NSPanel {
         retainedSelf = nil
     }
 
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeKey: Bool { keyboardCaptureEnabled }
+    override var canBecomeMain: Bool { keyboardCaptureEnabled }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           keyboardCaptureEnabled,
+           let localKeyHandler,
+           localKeyHandler(event) {
+            return
+        }
+        super.sendEvent(event)
+    }
 }
 
 // MARK: - C callback (must be a free function, not a closure)
