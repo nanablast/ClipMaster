@@ -3,7 +3,7 @@ import Vision
 
 enum OCRService {
     /// Recognize text from image data using macOS Vision framework.
-    /// Supports Chinese and English. Returns recognized text or empty string.
+    /// Supports Chinese, Japanese and English. Returns recognized text or empty string.
     static func recognizeText(from imageData: Data) -> String {
         guard let nsImage = NSImage(data: imageData),
               let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
@@ -13,7 +13,7 @@ enum OCRService {
 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "ja-JP", "en-US"]
         request.usesLanguageCorrection = true
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
