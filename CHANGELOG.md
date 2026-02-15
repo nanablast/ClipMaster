@@ -10,6 +10,25 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 - Open-source project docs (`README`, `CONTRIBUTING`, `CODE_OF_CONDUCT`, `LICENSE`)
 
+## [0.1.4] - 2026-02-15
+
+### Changed
+
+- OCR text recognition now uses multi-pass fallback for CJK-heavy content:
+  - mixed CJK (`zh-Hans`/`zh-Hant`/`ja-JP`/`en-US`)
+  - Japanese-priority pass
+  - Japanese-only pass
+  - auto-language fallback
+
+### Fixed
+
+- Fixed Japanese OCR returning "未找到文字" for some screenshots/images.
+
+### Notes
+
+- `v0.1.2` and `v0.1.3` may still fail on some Japanese inputs.
+- Users should upgrade to `v0.1.4` or newer for Japanese OCR.
+
 ## [1.0.0] - 2026-02-13
 
 ### Added
@@ -39,4 +58,3 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Cursor/scroll behavior edge cases in quick and main panels
 - Event tap recovery path for paste queue mode
 - Safer database recovery path with backup before destructive reset
-

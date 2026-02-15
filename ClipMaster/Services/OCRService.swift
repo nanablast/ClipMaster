@@ -2,8 +2,43 @@ import AppKit
 import Vision
 
 enum OCRService {
+    private struct OCRPass {
+        let name: String
+        let languages: [String]?
+        let recognitionLevel: VNRequestTextRecognitionLevel
+        let usesLanguageCorrection: Bool
+    }
+
+    private static let ocrPasses: [OCRPass] = [
+        OCRPass(
+            name: "mixed-cjk",
+            languages: ["zh-Hans", "zh-Hant", "ja-JP", "en-US"],
+            recognitionLevel: .accurate,
+            usesLanguageCorrection: true
+        ),
+        OCRPass(
+            name: "jp-priority",
+            languages: ["ja-JP", "zh-Hans", "zh-Hant", "en-US"],
+            recognitionLevel: .accurate,
+            usesLanguageCorrection: false
+        ),
+        OCRPass(
+            name: "jp-only",
+            languages: ["ja-JP"],
+            recognitionLevel: .accurate,
+            usesLanguageCorrection: false
+        ),
+        OCRPass(
+            name: "auto-fallback",
+            languages: nil,
+            recognitionLevel: .accurate,
+            usesLanguageCorrection: false
+        ),
+    ]
+
     /// Recognize text from image data using macOS Vision framework.
-    /// Supports Chinese, Japanese and English. Returns recognized text or empty string.
+    /// Supports Chinese, Japanese and English. Uses multi-pass fallback.
+    /// Returns recognized text or empty string.
     static func recognizeText(from imageData: Data) -> String {
         guard let nsImage = NSImage(data: imageData),
               let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
@@ -11,28 +46,42 @@ enum OCRService {
             return ""
         }
 
+        for pass in ocrPasses {
+            if let result = recognizeText(cgImage: cgImage, pass: pass),
+               !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return result
+            }
+        }
+
+        debugLog("[ClipMaster OCR] 所有识别策略均未命中")
+        return ""
+    }
+
+    private static func recognizeText(cgImage: CGImage, pass: OCRPass) -> String? {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "ja-JP", "en-US"]
-        request.usesLanguageCorrection = true
+        request.recognitionLevel = pass.recognitionLevel
+        request.usesLanguageCorrection = pass.usesLanguageCorrection
+        if let languages = pass.languages {
+            request.recognitionLanguages = languages
+        }
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
             try handler.perform([request])
         } catch {
-            debugLog("[ClipMaster OCR] perform 失败: \(error)")
-            return ""
+            debugLog("[ClipMaster OCR] pass=\(pass.name) perform 失败: \(error)")
+            return nil
         }
 
         guard let observations = request.results, !observations.isEmpty else {
-            debugLog("[ClipMaster OCR] 无识别结果")
-            return ""
+            debugLog("[ClipMaster OCR] pass=\(pass.name) 无识别结果")
+            return nil
         }
 
         let lines = observations.compactMap { $0.topCandidates(1).first?.string }
-        let result = lines.joined(separator: "\n")
-        debugLog("[ClipMaster OCR] 识别到 \(lines.count) 行文字")
-        return result
+        let result = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        debugLog("[ClipMaster OCR] pass=\(pass.name) 识别到 \(lines.count) 行")
+        return result.isEmpty ? nil : result
     }
 
     private static func debugLog(_ message: @autoclosure () -> String) {
