@@ -30,6 +30,11 @@ done
 # 生成 PkgInfo
 echo -n "APPL????" > "${APP_PATH}/Contents/PkgInfo"
 
+echo "=== 签名应用（ad-hoc）==="
+chmod -R u+w "${APP_PATH}"
+codesign --force --deep --sign - "${APP_PATH}"
+codesign --verify --deep --strict "${APP_PATH}"
+
 echo "=== 构建完成 ==="
 echo "应用位置: ${APP_PATH}"
 echo ""

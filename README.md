@@ -52,6 +52,17 @@ tccutil reset ScreenCapture com.clipmaster.app
 
 然后在「系统设置 → 隐私与安全性」中重新授权。
 
+## 下载版无法打开（“已损坏”）排查
+
+如果从浏览器下载 Release 后出现“`ClipMaster.app` 已损坏，无法打开”，通常是 macOS 隔离属性触发。
+
+执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/ClipMaster.app
+open /Applications/ClipMaster.app
+```
+
 ## 数据与日志
 
 - 数据库：`~/Library/Application Support/ClipMaster/ClipMaster.sqlite`
@@ -97,4 +108,3 @@ bash build.sh
 ## 许可证
 
 [MIT](./LICENSE)
-
