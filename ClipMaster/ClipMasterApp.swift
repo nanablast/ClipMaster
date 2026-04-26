@@ -141,7 +141,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeyManager.onScreenshotOCR = {
             ScreenshotOCRService.captureAndOCR()
         }
-        hotKeyManager.register()
+        do {
+            try hotKeyManager.reloadFromUserDefaults()
+        } catch {
+            AppLogger.app.error("Hot key setup failed: \(error.localizedDescription, privacy: .public)")
+            ToastService.shared.show(
+                message: "快捷键配置无效，已恢复默认值",
+                systemImage: "exclamationmark.triangle.fill",
+                tintColor: .systemOrange,
+                duration: 1.8
+            )
+        }
     }
 
     // MARK: - Menu Bar Popover

@@ -10,6 +10,20 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 - Open-source project docs (`README`, `CONTRIBUTING`, `CODE_OF_CONDUCT`, `LICENSE`)
 
+## [0.1.5] - 2026-04-26
+
+### Added
+
+- Configurable global hotkeys in Settings for:
+  - quick paste panel
+  - paste queue mode
+  - screenshot OCR
+
+### Changed
+
+- Global hotkey settings now validate duplicate bindings, reserved in-panel shortcuts, and system shortcut conflicts.
+- In-panel shortcuts (`⏎`, `⇧⏎`, `0-9`, `⌘⌫`) remain fixed in this release.
+
 ## [0.1.4] - 2026-02-15
 
 ### Changed

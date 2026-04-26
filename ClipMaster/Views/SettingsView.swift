@@ -1,6 +1,7 @@
 import AppKit
-import SwiftUI
+import HotKey
 import LaunchAtLogin
+import SwiftUI
 
 struct SettingsView: View {
     @AppStorage(Constants.UserDefaultsKeys.maxHistoryCount)
@@ -11,9 +12,29 @@ struct SettingsView: View {
 
     @AppStorage(Constants.UserDefaultsKeys.soundName)
     private var soundName: String = Constants.defaultSoundName
+
+    @AppStorage(Constants.UserDefaultsKeys.quickPasteHotKeyCode)
+    private var quickPasteHotKeyCode: Int = Int(Constants.GlobalHotKeyAction.quickPaste.defaultKeyCombo.carbonKeyCode)
+
+    @AppStorage(Constants.UserDefaultsKeys.quickPasteHotKeyModifiers)
+    private var quickPasteHotKeyModifiers: Int = Int(Constants.GlobalHotKeyAction.quickPaste.defaultKeyCombo.carbonModifiers)
+
+    @AppStorage(Constants.UserDefaultsKeys.pasteQueueHotKeyCode)
+    private var pasteQueueHotKeyCode: Int = Int(Constants.GlobalHotKeyAction.pasteQueue.defaultKeyCombo.carbonKeyCode)
+
+    @AppStorage(Constants.UserDefaultsKeys.pasteQueueHotKeyModifiers)
+    private var pasteQueueHotKeyModifiers: Int = Int(Constants.GlobalHotKeyAction.pasteQueue.defaultKeyCombo.carbonModifiers)
+
+    @AppStorage(Constants.UserDefaultsKeys.screenshotOCRHotKeyCode)
+    private var screenshotOCRHotKeyCode: Int = Int(Constants.GlobalHotKeyAction.screenshotOCR.defaultKeyCombo.carbonKeyCode)
+
+    @AppStorage(Constants.UserDefaultsKeys.screenshotOCRHotKeyModifiers)
+    private var screenshotOCRHotKeyModifiers: Int = Int(Constants.GlobalHotKeyAction.screenshotOCR.defaultKeyCombo.carbonModifiers)
+
     @State private var showClearAllConfirmation = false
     @State private var accessibilityGranted = false
     @State private var screenCaptureGranted = false
+    @State private var hotKeyErrorMessage: String?
 
     var body: some View {
         Form {
@@ -52,10 +73,27 @@ struct SettingsView: View {
                     .foregroundStyle(.tertiary)
             }
 
-            Section("快捷键") {
-                shortcutRow("快速粘贴面板（不失焦）", shortcut: "⌘ ;")
-                shortcutRow("粘贴队列模式", shortcut: "⌘ '")
-                shortcutRow("截图区域 OCR", shortcut: "⌘ ⇧ O")
+            Section("全局快捷键") {
+                hotKeyRecorderRow(for: .quickPaste)
+                hotKeyRecorderRow(for: .pasteQueue)
+                hotKeyRecorderRow(for: .screenshotOCR)
+
+                HStack {
+                    Spacer()
+                    Button("恢复全部默认") {
+                        restoreAllHotKeys()
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let hotKeyErrorMessage {
+                    Text(hotKeyErrorMessage)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Section("面板内快捷键（暂不支持修改）") {
                 shortcutRow("粘贴选中项", shortcut: "⏎")
                 shortcutRow("粘贴为纯文本 / OCR文字", shortcut: "⇧ ⏎")
                 shortcutRow("快速选择粘贴", shortcut: "0-9")
@@ -111,7 +149,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 400, height: 440)
+        .frame(width: 460, height: 520)
         .alert("确认清空所有历史记录？", isPresented: $showClearAllConfirmation) {
             Button("取消", role: .cancel) {}
             Button("清空", role: .destructive) {
@@ -123,6 +161,7 @@ struct SettingsView: View {
         .onAppear {
             maxHistoryCount = Constants.normalizedMaxHistoryCount(maxHistoryCount)
             refreshPermissionStatus()
+            normalizeStoredHotKeys()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshPermissionStatus()
@@ -140,6 +179,131 @@ struct SettingsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 5))
                 .font(.system(size: 12, design: .monospaced))
         }
+    }
+
+    private func hotKeyRecorderRow(for action: Constants.GlobalHotKeyAction) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text(action.title)
+            Spacer()
+            ShortcutRecorderField(
+                keyCombo: binding(for: action),
+                onRecord: { newValue in
+                    saveHotKey(newValue, for: action)
+                }
+            )
+            .frame(width: 130)
+
+            Button("恢复默认") {
+                saveHotKey(action.defaultKeyCombo, for: action)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11))
+        }
+    }
+
+    private func binding(for action: Constants.GlobalHotKeyAction) -> Binding<KeyCombo> {
+        Binding(
+            get: { currentKeyCombo(for: action) },
+            set: { saveHotKey($0, for: action) }
+        )
+    }
+
+    private func currentKeyCombo(for action: Constants.GlobalHotKeyAction) -> KeyCombo {
+        switch action {
+        case .quickPaste:
+            Constants.globalHotKey(
+                keyCode: quickPasteHotKeyCode,
+                modifiers: quickPasteHotKeyModifiers,
+                fallback: action.defaultKeyCombo
+            )
+        case .pasteQueue:
+            Constants.globalHotKey(
+                keyCode: pasteQueueHotKeyCode,
+                modifiers: pasteQueueHotKeyModifiers,
+                fallback: action.defaultKeyCombo
+            )
+        case .screenshotOCR:
+            Constants.globalHotKey(
+                keyCode: screenshotOCRHotKeyCode,
+                modifiers: screenshotOCRHotKeyModifiers,
+                fallback: action.defaultKeyCombo
+            )
+        }
+    }
+
+    private func setCurrentKeyCombo(_ keyCombo: KeyCombo, for action: Constants.GlobalHotKeyAction) {
+        let normalized = Constants.normalizedGlobalHotKey(keyCombo)
+        switch action {
+        case .quickPaste:
+            quickPasteHotKeyCode = Int(normalized.carbonKeyCode)
+            quickPasteHotKeyModifiers = Int(normalized.carbonModifiers)
+        case .pasteQueue:
+            pasteQueueHotKeyCode = Int(normalized.carbonKeyCode)
+            pasteQueueHotKeyModifiers = Int(normalized.carbonModifiers)
+        case .screenshotOCR:
+            screenshotOCRHotKeyCode = Int(normalized.carbonKeyCode)
+            screenshotOCRHotKeyModifiers = Int(normalized.carbonModifiers)
+        }
+    }
+
+    private func saveHotKey(_ keyCombo: KeyCombo, for action: Constants.GlobalHotKeyAction) {
+        let normalized = Constants.normalizedGlobalHotKey(keyCombo)
+        let previous = snapshotHotKeyStorage()
+        var candidate = allCurrentKeyCombos()
+        candidate[action] = normalized
+
+        do {
+            try HotKeyManager.shared.validate(candidate)
+            setCurrentKeyCombo(normalized, for: action)
+            try HotKeyManager.shared.reloadFromUserDefaults()
+            hotKeyErrorMessage = nil
+        } catch {
+            restoreHotKeyStorage(previous)
+            try? HotKeyManager.shared.reloadFromUserDefaults()
+            hotKeyErrorMessage = error.localizedDescription
+            NSSound.beep()
+        }
+    }
+
+    private func restoreAllHotKeys() {
+        let previous = snapshotHotKeyStorage()
+        do {
+            try HotKeyManager.shared.restoreDefaults()
+            syncHotKeyStorageFromDefaults()
+            hotKeyErrorMessage = nil
+        } catch {
+            restoreHotKeyStorage(previous)
+            try? HotKeyManager.shared.reloadFromUserDefaults()
+            hotKeyErrorMessage = error.localizedDescription
+            NSSound.beep()
+        }
+    }
+
+    private func allCurrentKeyCombos() -> [Constants.GlobalHotKeyAction: KeyCombo] {
+        Dictionary(uniqueKeysWithValues: Constants.GlobalHotKeyAction.allCases.map { action in
+            (action, currentKeyCombo(for: action))
+        })
+    }
+
+    private func snapshotHotKeyStorage() -> [Constants.GlobalHotKeyAction: KeyCombo] {
+        allCurrentKeyCombos()
+    }
+
+    private func restoreHotKeyStorage(_ snapshot: [Constants.GlobalHotKeyAction: KeyCombo]) {
+        for action in Constants.GlobalHotKeyAction.allCases {
+            guard let keyCombo = snapshot[action] else { continue }
+            setCurrentKeyCombo(keyCombo, for: action)
+        }
+    }
+
+    private func syncHotKeyStorageFromDefaults() {
+        for action in Constants.GlobalHotKeyAction.allCases {
+            setCurrentKeyCombo(Constants.storedGlobalHotKey(for: action), for: action)
+        }
+    }
+
+    private func normalizeStoredHotKeys() {
+        syncHotKeyStorageFromDefaults()
     }
 
     private func permissionStatusRow(_ label: String, granted: Bool) -> some View {
