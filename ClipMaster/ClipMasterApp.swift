@@ -5,8 +5,8 @@ struct ClipMasterApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        Settings {
-            SettingsView()
+        WindowGroup(id: "main") {
+            EmptyView()
         }
     }
 }
