@@ -5,8 +5,8 @@ struct ClipMasterApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        WindowGroup(id: "main") {
-            EmptyView()
+        Settings {
+            SettingsView()
         }
     }
 }
@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NSApp.windows.forEach { $0.close() }
 
         requestAccessibilityPermissionIfNeeded()
 
