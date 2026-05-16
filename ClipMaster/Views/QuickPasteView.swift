@@ -125,6 +125,11 @@ struct QuickPasteView: View {
                                 .onTapGesture {
                                     onItemSelect(index)
                                 }
+                                .contextMenu {
+                                    if item.type == .image {
+                                        Button("保存图片") { saveImageToDownloads(item) }
+                                    }
+                                }
                             }
                         }
                         .padding(.horizontal, 6)
@@ -161,6 +166,39 @@ struct QuickPasteView: View {
             } else {
                 proxy.scrollTo(targetID, anchor: .center)
             }
+        }
+    }
+
+    private func saveImageToDownloads(_ item: ClipboardItem) {
+        guard item.type == .image,
+              let data = try? StorageService.shared.fetchImageData(for: item.id) else {
+            ToastService.shared.show(
+                message: "图片数据不存在",
+                systemImage: "xmark.circle.fill",
+                tintColor: .systemRed
+            )
+            return
+        }
+
+        let downloadsURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let filename = "ClipMaster-\(timestamp).png"
+        let fileURL = downloadsURL.appendingPathComponent(filename)
+
+        do {
+            try data.write(to: fileURL)
+            ToastService.shared.show(
+                message: "已保存到 Downloads/\(filename)",
+                systemImage: "checkmark.circle.fill",
+                tintColor: .systemGreen
+            )
+        } catch {
+            AppLogger.ui.error("Save image failed: \(error.localizedDescription, privacy: .public)")
+            ToastService.shared.show(
+                message: "保存失败",
+                systemImage: "xmark.circle.fill",
+                tintColor: .systemRed
+            )
         }
     }
 }

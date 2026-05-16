@@ -10,6 +10,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 - Open-source project docs (`README`, `CONTRIBUTING`, `CODE_OF_CONDUCT`, `LICENSE`)
 
+## [0.1.6] - 2026-05-16
+
+### Added
+
+- Save image to ~/Downloads via context menu on image clipboard items
+
 ## [0.1.5] - 2026-04-26
 
 ### Added
