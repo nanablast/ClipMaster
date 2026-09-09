@@ -414,6 +414,8 @@ final class StorageService {
 
     func insert(_ item: ClipboardItem) throws {
         try ensureWritable()
+        // Single write transaction: dedup + insert + history-limit trim,
+        // avoiding a second serialized write on every copy.
         try dbQueue.write { db in
             let duplicateItems = try findDuplicateItems(for: item, in: db)
             for duplicate in duplicateItems {
@@ -424,9 +426,8 @@ final class StorageService {
             }
 
             try item.insert(db)
+            try enforceMaxHistoryCount(in: db)
         }
-
-        try enforceMaxHistoryCount()
     }
 
     func fetchAll(limit: Int = 50, offset: Int = 0) throws -> [ClipboardItem] {
@@ -525,8 +526,10 @@ final class StorageService {
 
     // MARK: - History Limit
 
-    private func enforceMaxHistoryCount() throws {
-        try ensureWritable()
+    /// Enforce the history cap inside an open write transaction.
+    /// Reads the limit from UserDefaults each call so a live setting
+    /// change applies on the next insert.
+    private func enforceMaxHistoryCount(in db: Database) throws {
         let defaults = UserDefaults.standard
         let key = Constants.UserDefaultsKeys.maxHistoryCount
         let storedValue = defaults.object(forKey: key) as? Int
@@ -541,21 +544,19 @@ final class StorageService {
             limit = Constants.defaultMaxHistoryCount
         }
 
-        try dbQueue.write { db in
-            let count = try ClipboardItem.fetchCount(db)
-            if count > limit {
-                let overflow = count - limit
-                let oldestItems = try ClipboardItem
-                    .order(ClipboardItem.Columns.createdAt.asc)
-                    .limit(overflow)
-                    .fetchAll(db)
-                for item in oldestItems {
-                    // Delete associated image file
-                    if let path = item.imagePath {
-                        removeImageFile(filename: path)
-                    }
-                    _ = try item.delete(db)
+        let count = try ClipboardItem.fetchCount(db)
+        if count > limit {
+            let overflow = count - limit
+            let oldestItems = try ClipboardItem
+                .order(ClipboardItem.Columns.createdAt.asc)
+                .limit(overflow)
+                .fetchAll(db)
+            for item in oldestItems {
+                // Delete associated image file
+                if let path = item.imagePath {
+                    removeImageFile(filename: path)
                 }
+                _ = try item.delete(db)
             }
         }
     }

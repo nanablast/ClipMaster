@@ -6,7 +6,7 @@ enum Constants {
     static let minMaxHistoryCount = 50
     static let maxMaxHistoryCount = 5_000
     static let clipboardPollActiveInterval: TimeInterval = 0.20
-    static let clipboardPollIdleInterval: TimeInterval = 1.00
+    static let clipboardPollIdleInterval: TimeInterval = 3.00
     static let clipboardIdleThreshold = 8
     static let clipboardPollLeeway: TimeInterval = 0.05
     static let accessibilityPromptMinInterval: TimeInterval = 24 * 60 * 60
