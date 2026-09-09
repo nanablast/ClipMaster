@@ -367,31 +367,43 @@ final class StorageService {
 
     /// Expire image entries after clearing session cache.
     /// Keeps OCR text by downgrading image rows to text when possible.
+    /// Runs as batch SQL instead of loading every image row into memory,
+    /// so startup cost stays flat as history grows.
     func expireSessionImages() {
         guard mode == .readWrite else { return }
         do {
             try dbQueue.write { db in
-                let imageItems = try ClipboardItem
-                    .filter(ClipboardItem.Columns.type == ContentType.image.rawValue)
-                    .fetchAll(db)
+                let table = ClipboardItem.databaseTableName
+                let placeholder = Constants.imagePlaceholderText
+                // SQLite's trim() only strips listed chars; cover the whitespace
+                // set Swift's trimmingCharacters(in: .whitespacesAndNewlines) does.
+                let whitespace = "char(9)||char(10)||char(13)||' '"
 
-                for item in imageItems {
-                    let normalized = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                // 1. Downgrade image rows carrying real OCR text to text rows
+                //    (content unchanged, so FTS stays in sync via triggers).
+                try db.execute(sql: """
+                    UPDATE \(table)
+                    SET type = ?, imagePath = NULL, imageHash = NULL
+                    WHERE type = ?
+                      AND trim(content, \(whitespace)) != ''
+                      AND trim(content, \(whitespace)) != ?
+                    """, arguments: [ContentType.text.rawValue, ContentType.image.rawValue, placeholder])
 
-                    if normalized.isEmpty || normalized == Constants.imagePlaceholderText {
-                        if let path = item.imagePath {
-                            removeImageFile(filename: path)
-                        }
-                        _ = try item.delete(db)
-                        continue
+                // 2. Remaining image rows hold no useful text: remove files, then rows.
+                let staleRows = try Row.fetchAll(
+                    db,
+                    sql: "SELECT imagePath FROM \(table) WHERE type = ? AND imagePath IS NOT NULL",
+                    arguments: [ContentType.image.rawValue]
+                )
+                for row in staleRows {
+                    if let path = row["imagePath"] as String? {
+                        removeImageFile(filename: path)
                     }
-
-                    var downgraded = item
-                    downgraded.type = .text
-                    downgraded.imagePath = nil
-                    downgraded.imageHash = nil
-                    try downgraded.update(db)
                 }
+                try db.execute(
+                    sql: "DELETE FROM \(table) WHERE type = ?",
+                    arguments: [ContentType.image.rawValue]
+                )
             }
         } catch {
             AppLogger.storage.error("Failed to expire session images: \(error.localizedDescription, privacy: .public)")

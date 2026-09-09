@@ -183,6 +183,55 @@ final class StorageServiceTests: XCTestCase {
         XCTAssertEqual(matches.first?.type, .text)
     }
 
+    func testExpireSessionImagesTreatsWhitespaceOnlyAsEmptyAndDeletes() throws {
+        let blankID = UUID()
+        let newlineID = UUID()
+        let textID = UUID()
+        let blankPath = storage.saveImageFile(Data([0x01]), id: blankID)
+        let newlinePath = storage.saveImageFile(Data([0x02]), id: newlineID)
+        let textPath = storage.saveImageFile(Data([0x03]), id: textID)
+
+        try storage.insert(ClipboardItem(
+            id: blankID,
+            content: "   ",
+            type: .image,
+            imagePath: blankPath,
+            imageHash: "hash-blank"
+        ))
+        try storage.insert(ClipboardItem(
+            id: newlineID,
+            content: "\n\t\r ",
+            type: .image,
+            imagePath: newlinePath,
+            imageHash: "hash-newline"
+        ))
+        try storage.insert(ClipboardItem(
+            id: textID,
+            content: "  有文本  ",
+            type: .image,
+            imagePath: textPath,
+            imageHash: "hash-text"
+        ))
+        // Non-image rows must never be touched by the expire pass.
+        try storage.insert(ClipboardItem(content: "plain", type: .text, appSource: "KeepMe"))
+
+        // Session cache is cleared at startup; files are gone before rows are reaped.
+        storage.clearImageCache()
+        storage.expireSessionImages()
+
+        let all = try storage.fetchAll(limit: 10)
+        XCTAssertEqual(all.count, 2)
+
+        let remainingText = all.first { $0.content == "  有文本  " }
+        XCTAssertNotNil(remainingText)
+        XCTAssertEqual(remainingText?.type, .text)
+        XCTAssertNil(remainingText?.imagePath)
+        XCTAssertNil(remainingText?.imageHash)
+
+        XCTAssertNotNil(all.first { $0.content == "plain" })
+        XCTAssertTrue(all.allSatisfy { $0.type == .text })
+    }
+
     func testHistoryLimitUsesClampedMinimumSetting() throws {
         let defaults = UserDefaults.standard
         let key = Constants.UserDefaultsKeys.maxHistoryCount

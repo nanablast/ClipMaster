@@ -38,7 +38,9 @@ struct ClipboardItemRow: View {
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
-                        Text(item.createdAt, style: .relative)
+                        // Static time text — avoids SwiftUI's live-updating .relative style,
+                        // which schedules per-row refresh timers while the panel is open.
+                        Text(createdAtText)
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }
@@ -80,6 +82,31 @@ struct ClipboardItemRow: View {
         case .link: .blue
         case .file: .green
         }
+    }
+
+    /// Static, pre-computed display text for the item's timestamp.
+    /// Rendered once per row update instead of live-updating every second.
+    private var createdAtText: String {
+        let calendar = Calendar.current
+        let now = Date()
+        let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: item.createdAt)
+        let hourMinute = String(format: "%02d:%02d", comps.hour ?? 0, comps.minute ?? 0)
+
+        if calendar.isDateInToday(item.createdAt) {
+            let minutes = max(0, Int(now.timeIntervalSince(item.createdAt) / 60))
+            if minutes < 1 { return "刚刚" }
+            if minutes < 60 { return "\(minutes) 分钟前" }
+            return hourMinute
+        }
+        if calendar.isDateInYesterday(item.createdAt) {
+            return "昨天 \(hourMinute)"
+        }
+
+        let nowComps = calendar.dateComponents([.year], from: now)
+        if comps.year == nowComps.year {
+            return "\(comps.month ?? 0)月\(comps.day ?? 0)日 \(hourMinute)"
+        }
+        return "\(comps.year ?? 0)年\(comps.month ?? 0)月\(comps.day ?? 0)日"
     }
 
     @ViewBuilder
