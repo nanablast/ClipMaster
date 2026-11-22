@@ -71,7 +71,7 @@ struct ClipboardItemRow: View {
         case .link:
             Image(systemName: "link")
         case .file:
-            Image(systemName: "doc")
+            Image(systemName: MediaFilePresentation(content: item.content).iconSystemName)
         }
     }
 
@@ -125,7 +125,17 @@ struct ClipboardItemRow: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-        case .text, .link, .file:
+        case .file:
+            let presentation = MediaFilePresentation(content: item.content)
+            HStack(spacing: 6) {
+                if let fileURL = presentation.singleImageURL {
+                    ImageThumbnail(fileURL: fileURL, maxHeight: 36)
+                        .frame(maxWidth: 36)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                Text(presentation.displayText)
+            }
+        case .text, .link:
             Text(item.content)
         }
     }

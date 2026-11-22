@@ -1,367 +1,294 @@
 import AppKit
 import Combine
-import CryptoKit
 
 struct ClipboardPollPolicy {
     private(set) var interval: TimeInterval = Constants.clipboardPollActiveInterval
-    private(set) var noChangeStreak = 0
+    private var lastClipboardActivity: TimeInterval
 
-    mutating func reset() {
+    init(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        lastClipboardActivity = now
+    }
+
+    mutating func reset(now: TimeInterval) {
         interval = Constants.clipboardPollActiveInterval
-        noChangeStreak = 0
+        lastClipboardActivity = now
     }
 
     @discardableResult
-    mutating func recordNoChange() -> Bool {
-        noChangeStreak += 1
-        guard interval != Constants.clipboardPollIdleInterval else { return false }
-        guard noChangeStreak >= Constants.clipboardIdleThreshold else { return false }
-        interval = Constants.clipboardPollIdleInterval
+    mutating func recordPoll(hasChanges: Bool, userIdleDuration: TimeInterval, now: TimeInterval) -> Bool {
+        if hasChanges { lastClipboardActivity = now }
+        let isIdle = userIdleDuration.isFinite
+            && userIdleDuration >= Constants.clipboardIdleDelay
+            && now - lastClipboardActivity >= Constants.clipboardIdleDelay
+        let next = isIdle ? Constants.clipboardPollIdleInterval : Constants.clipboardPollActiveInterval
+        guard next != interval else { return false }
+        interval = next
         return true
     }
 
-    @discardableResult
-    mutating func recordChange() -> Bool {
-        noChangeStreak = 0
-        guard interval != Constants.clipboardPollActiveInterval else { return false }
-        interval = Constants.clipboardPollActiveInterval
-        return true
+    static func userIdleDuration() -> TimeInterval {
+        // Reads an elapsed duration, without installing a keyboard/event monitor.
+        CGEventSource.secondsSinceLastEventType(
+            .combinedSessionState,
+            eventType: CGEventType(rawValue: UInt32.max)!
+        )
     }
 }
 
-final class ClipboardMonitor: ObservableObject {
-    @Published var latestItem: ClipboardItem?
+private final class ClipboardProcessingSession {
+    private let lock = NSLock()
+    private var cancelled = false
 
-    private struct ClipboardSnapshot {
-        let appSource: String?
-        let rawImageData: Data?
-        let fileURLs: [URL]?
-        let stringContent: String?
-        let hasFileURL: Bool
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
     }
 
-    private var pollTimer: DispatchSourceTimer?
-    private var pollPolicy = ClipboardPollPolicy()
-    private var lastChangeCount: Int
-    private var pendingChangeCount: Int?
-    private var isProcessing = false
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        cancelled = true
+    }
 
-    private let pollQueue = DispatchQueue(label: "com.clipmaster.clipboard.poll", qos: .utility)
+    // Serialize the final storage commit with stop(). Expensive OCR runs outside this lock.
+    func commitIfActive<T>(_ work: () throws -> T) rethrows -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return nil }
+        return try work()
+    }
+}
+
+/// Polling, lifecycle state, buffering and publication are confined to the main queue.
+/// Only immutable snapshots and a cancellable session cross to the processing queue.
+final class ClipboardMonitor: ObservableObject {
+    @Published private(set) var latestItem: ClipboardItem?
+
+    private enum SuspensionReason: Hashable {
+        case systemSleep, screenSleep, inactiveSession
+    }
+
+    private let reader: ClipboardSnapshotReading
+    private let notificationCenter: NotificationCenter
+    private let automaticallyPoll: Bool
+    private let userIdleDuration: () -> TimeInterval
+    private let uptime: () -> TimeInterval
+    private let prepare: (ClipboardSnapshot) -> PreparedClipboardItem?
+    private let persist: (PreparedClipboardItem) throws -> ClipboardItem
+    private let didCopy: () -> Void
+    private let onOversizedCopy: () -> Void
     private let processingQueue = DispatchQueue(label: "com.clipmaster.clipboard.processing", qos: .userInitiated)
-    private let pasteboard = NSPasteboard.general
-    private let storageService = StorageService.shared
 
-    init() {
-        self.lastChangeCount = pasteboard.changeCount
+    private var pollTimer: DispatchSourceTimer?
+    private var pollPolicy: ClipboardPollPolicy
+    private var lastChangeCount: Int
+    private var lastObservedChangeCount: Int
+    private var retryChangeCount: Int?
+    private var readAttempts = 0
+    private var snapshots = ClipboardSnapshotBuffer()
+    private var session: ClipboardProcessingSession?
+    private var isProcessing = false
+    private var suspensionReasons: Set<SuspensionReason> = []
+    private var observers: [NSObjectProtocol] = []
+
+    init(
+        reader: ClipboardSnapshotReading = PasteboardSnapshotReader(),
+        notificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+        automaticallyPoll: Bool = true,
+        userIdleDuration: @escaping () -> TimeInterval = ClipboardPollPolicy.userIdleDuration,
+        uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        prepare: @escaping (ClipboardSnapshot) -> PreparedClipboardItem? = ClipboardSnapshotProcessor().prepare,
+        persist: @escaping (PreparedClipboardItem) throws -> ClipboardItem = { try $0.persist(using: .shared) },
+        didCopy: (() -> Void)? = nil,
+        onOversizedCopy: (() -> Void)? = nil
+    ) {
+        self.reader = reader
+        self.notificationCenter = notificationCenter
+        self.automaticallyPoll = automaticallyPoll
+        self.userIdleDuration = userIdleDuration
+        self.uptime = uptime
+        self.prepare = prepare
+        self.persist = persist
+        self.didCopy = didCopy ?? Self.playCopySoundIfNeeded
+        self.onOversizedCopy = onOversizedCopy ?? {}
+        self.lastChangeCount = reader.changeCount
+        self.lastObservedChangeCount = reader.changeCount
+        self.pollPolicy = ClipboardPollPolicy(now: uptime())
+    }
+
+    deinit {
+        pollTimer?.cancel()
+        session?.cancel()
+        observers.forEach(notificationCenter.removeObserver)
     }
 
     func start() {
+        dispatchPrecondition(condition: .onQueue(.main))
         stop()
-        lastChangeCount = pasteboard.changeCount
-        pendingChangeCount = nil
-        isProcessing = false
-        pollPolicy.reset()
-        configurePollTimer(interval: pollPolicy.interval)
+        lastChangeCount = reader.changeCount
+        lastObservedChangeCount = lastChangeCount
+        session = ClipboardProcessingSession()
+        observeWorkspace()
+        configurePollTimer()
     }
 
     func stop() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        cancelPollTimer()
+        session?.cancel()
+        session = nil
+        snapshots.removeAll()
+        retryChangeCount = nil
+        readAttempts = 0
+        pollPolicy.reset(now: uptime())
+        suspensionReasons.removeAll()
+        observers.forEach(notificationCenter.removeObserver)
+        observers.removeAll()
+        // An old worker may still be finishing OCR. It retains the processing slot until
+        // its completion, so repeated stop/start cannot accumulate background jobs.
+    }
+
+    private func cancelPollTimer() {
         pollTimer?.setEventHandler {}
         pollTimer?.cancel()
         pollTimer = nil
-        pendingChangeCount = nil
-        isProcessing = false
-        pollPolicy.reset()
     }
 
-    private func configurePollTimer(interval: TimeInterval) {
-        pollTimer?.setEventHandler {}
-        pollTimer?.cancel()
-
-        let timer = DispatchSource.makeTimerSource(queue: pollQueue)
+    private func configurePollTimer() {
+        cancelPollTimer()
+        guard automaticallyPoll, let session, suspensionReasons.isEmpty else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(
-            deadline: .now() + interval,
-            repeating: interval,
+            deadline: .now() + pollPolicy.interval,
+            repeating: pollPolicy.interval,
             leeway: .milliseconds(Int(Constants.clipboardPollLeeway * 1_000))
         )
-        timer.setEventHandler { [weak self] in
-            self?.handlePollTick()
+        timer.setEventHandler { [weak self, weak session] in
+            guard let self, let session, self.session === session else { return }
+            self.checkForChanges()
         }
         timer.resume()
         pollTimer = timer
     }
 
-    private func handlePollTick() {
-        DispatchQueue.main.async { [weak self] in
-            self?.checkForChanges()
-        }
-    }
+    // Also used for an immediate check on wake and for deterministic integration tests.
+    func checkForChanges() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard session != nil, suspensionReasons.isEmpty else { return }
 
-    private func checkForChanges() {
-        let currentCount = pasteboard.changeCount
-        guard currentCount != lastChangeCount else {
-            if pollPolicy.recordNoChange() {
-                configurePollTimer(interval: pollPolicy.interval)
+        let observedCount = reader.changeCount
+        if pollPolicy.recordPoll(
+            hasChanges: observedCount != lastObservedChangeCount,
+            userIdleDuration: userIdleDuration(),
+            now: uptime()
+        ) {
+            configurePollTimer()
+        }
+        lastObservedChangeCount = observedCount
+
+        // Retry a racing writer once immediately, then yield to the next timer tick.
+        for _ in 0..<2 {
+            let currentCount = reader.changeCount
+            guard currentCount != lastChangeCount else { return }
+            if retryChangeCount != currentCount {
+                retryChangeCount = currentCount
+                readAttempts = 0
             }
-            return
-        }
 
-        if pollPolicy.recordChange() {
-            configurePollTimer(interval: pollPolicy.interval)
-        }
-
-        lastChangeCount = currentCount
-        if isProcessing {
-            pendingChangeCount = currentCount
-            return
-        }
-
-        processChange(changeCount: currentCount)
-    }
-
-    private func processChange(changeCount: Int) {
-        guard !isProcessing else {
-            pendingChangeCount = changeCount
-            return
-        }
-
-        guard let snapshot = captureSnapshot(expectedChangeCount: changeCount) else {
-            let latestCount = pasteboard.changeCount
-            if latestCount != lastChangeCount {
-                lastChangeCount = latestCount
-                pendingChangeCount = latestCount
-            }
-            if let pending = pendingChangeCount, pending == lastChangeCount {
-                pendingChangeCount = nil
-                DispatchQueue.main.async { [weak self] in
-                    self?.processChange(changeCount: pending)
+            switch reader.readSnapshot(expectedChangeCount: currentCount) {
+            case .captured(let snapshot):
+                lastChangeCount = currentCount
+                retryChangeCount = nil
+                let result = snapshots.append(snapshot)
+                if !result.accepted {
+                    AppLogger.clipboard.warning("Clipboard snapshot exceeds the payload byte limit; skipped")
+                    onOversizedCopy()
+                } else if result.droppedCount > 0 {
+                    AppLogger.clipboard.warning("Clipboard backlog full; discarded \(result.droppedCount) oldest pending snapshots")
                 }
+                processNextSnapshot()
+                return
+            case .ignored:
+                lastChangeCount = currentCount
+                retryChangeCount = nil
+                return
+            case .retry:
+                if reader.changeCount != currentCount { continue }
+                readAttempts += 1
+                if readAttempts >= Constants.clipboardReadAttemptLimit {
+                    lastChangeCount = currentCount
+                    retryChangeCount = nil
+                    AppLogger.clipboard.debug("Clipboard data unavailable after bounded retries; skipped")
+                }
+                return
             }
-            return
         }
+    }
 
+    private func processNextSnapshot() {
+        guard let session, !isProcessing, suspensionReasons.isEmpty,
+              let snapshot = snapshots.popFirst() else { return }
         isProcessing = true
-        processingQueue.async { [weak self] in
-            guard let self else { return }
-            let item = self.buildClipboardItem(
-                appSource: snapshot.appSource,
-                rawImageData: snapshot.rawImageData,
-                fileURLs: snapshot.fileURLs,
-                stringContent: snapshot.stringContent,
-                hasFileURL: snapshot.hasFileURL
-            )
+        let prepare = self.prepare
+        let persist = self.persist
 
-            if let item {
+        processingQueue.async { [weak self] in
+            let savedItem: ClipboardItem? = autoreleasepool {
+                guard !session.isCancelled, let prepared = prepare(snapshot) else { return nil }
                 do {
-                    try self.storageService.insert(item)
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
-                        self.latestItem = item
-                        self.playCopySoundIfNeeded()
-                    }
+                    return try session.commitIfActive { try persist(prepared) }
                 } catch {
                     AppLogger.clipboard.error("Failed to save clipboard item: \(error.localizedDescription, privacy: .public)")
+                    return nil
                 }
             }
 
             DispatchQueue.main.async { [weak self] in
-                self?.finishProcessingCycle()
+                guard let self else { return }
+                self.isProcessing = false
+                if self.session === session, let savedItem {
+                    self.latestItem = savedItem
+                    self.didCopy()
+                }
+                self.processNextSnapshot()
             }
         }
     }
 
-    private func finishProcessingCycle() {
-        isProcessing = false
-        guard let pending = pendingChangeCount else { return }
-        pendingChangeCount = nil
-        processChange(changeCount: pending)
-    }
-
-    private func captureSnapshot(expectedChangeCount: Int) -> ClipboardSnapshot? {
-        guard pasteboard.changeCount == expectedChangeCount else { return nil }
-
-        let appSource = NSWorkspace.shared.frontmostApplication?.localizedName
-        let rawImageData = readRawImageData()
-        let hasFileURL = pasteboard.types?.contains(.fileURL) ?? false
-        let fileURLs = pasteboard.readObjects(forClasses: [NSURL.self], options: [
-            .urlReadingFileURLsOnly: true
-        ]) as? [URL]
-        let stringContent = pasteboard.string(forType: .string)
-
-        if shouldWriteDebugLog {
-            let types = pasteboard.types?.map { $0.rawValue } ?? []
-            let debugMsg = """
-            [\(Date())] 剪贴板变化
-            types: \(types.joined(separator: ", "))
-            imageData: \(rawImageData.map { "\($0.count) bytes" } ?? "nil")
-            hasString: \(stringContent != nil)
-            appSource: \(appSource ?? "nil")
-            ---
-            """
-            appendDebugLog(debugMsg)
+    private func observeWorkspace() {
+        guard let session else { return }
+        let notifications: [(Notification.Name, Notification.Name, SuspensionReason)] = [
+            (NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification, .systemSleep),
+            (NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification, .screenSleep),
+            (NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification, .inactiveSession)
+        ]
+        for (suspend, resume, reason) in notifications {
+            observers.append(notificationCenter.addObserver(forName: suspend, object: nil, queue: .main) { [weak self, weak session] _ in
+                guard let self, let session, self.session === session else { return }
+                self.suspensionReasons.insert(reason)
+                self.cancelPollTimer()
+            })
+            observers.append(notificationCenter.addObserver(forName: resume, object: nil, queue: .main) { [weak self, weak session] _ in
+                guard let self, let session, self.session === session,
+                      self.suspensionReasons.remove(reason) != nil, self.suspensionReasons.isEmpty else { return }
+                self.pollPolicy.reset(now: self.uptime())
+                self.configurePollTimer()
+                // Preserve the previous change count so copies made during suspension
+                // are checked immediately, instead of being silently acknowledged.
+                self.checkForChanges()
+                self.processNextSnapshot()
+            })
         }
-
-        guard pasteboard.changeCount == expectedChangeCount else { return nil }
-        return ClipboardSnapshot(
-            appSource: appSource,
-            rawImageData: rawImageData,
-            fileURLs: fileURLs,
-            stringContent: stringContent,
-            hasFileURL: hasFileURL
-        )
     }
 
-    private func playCopySoundIfNeeded() {
+    private static func playCopySoundIfNeeded() {
         let defaults = UserDefaults.standard
         let soundOff = defaults.object(forKey: Constants.UserDefaultsKeys.soundEnabled) != nil
             && !defaults.bool(forKey: Constants.UserDefaultsKeys.soundEnabled)
         if !soundOff {
             let name = defaults.string(forKey: Constants.UserDefaultsKeys.soundName) ?? Constants.defaultSoundName
             NSSound(named: name)?.play()
-        }
-    }
-
-    private func buildClipboardItem(
-        appSource: String?,
-        rawImageData: Data?,
-        fileURLs: [URL]?,
-        stringContent: String?,
-        hasFileURL: Bool
-    ) -> ClipboardItem? {
-        // If clipboard contains file URLs, it's a file copy (e.g. from Finder).
-        // Finder also puts the file icon as tiff, so we must check files first.
-        if hasFileURL, let fileURLs, !fileURLs.isEmpty {
-            let paths = fileURLs.map { $0.path }.joined(separator: "\n")
-
-            // If all files are images, treat as image copy and run OCR on the first one
-            let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "heic"]
-            let allImages = fileURLs.allSatisfy { imageExtensions.contains($0.pathExtension.lowercased()) }
-
-            if allImages, let firstURL = fileURLs.first,
-               let fileImageData = try? Data(contentsOf: firstURL) {
-                let normalizedImageData = normalizeImageData(fileImageData) ?? fileImageData
-                let ocrText = OCRService.recognizeText(from: normalizedImageData)
-                let content = ocrText.isEmpty ? paths : ocrText
-                let itemId = UUID()
-                let imagePath = storageService.saveImageFile(normalizedImageData, id: itemId)
-                let imageHash = sha256Hex(normalizedImageData)
-                return ClipboardItem(
-                    id: itemId,
-                    content: content,
-                    type: .image,
-                    appSource: appSource,
-                    imagePath: imagePath,
-                    imageHash: imageHash
-                )
-            }
-
-            return ClipboardItem(
-                content: paths,
-                type: .file,
-                appSource: appSource
-            )
-        }
-
-        // Pure image copy (screenshot, copy image from browser, etc.)
-        if let normalizedImageData = normalizeImageData(rawImageData) {
-            let ocrText = OCRService.recognizeText(from: normalizedImageData)
-            let content = ocrText.isEmpty ? Constants.imagePlaceholderText : ocrText
-            let itemId = UUID()
-            let imagePath = storageService.saveImageFile(normalizedImageData, id: itemId)
-            let imageHash = sha256Hex(normalizedImageData)
-            return ClipboardItem(
-                id: itemId,
-                content: content,
-                type: .image,
-                appSource: appSource,
-                imagePath: imagePath,
-                imageHash: imageHash
-            )
-        }
-
-        // Check for string content
-        if let string = stringContent, !string.isEmpty {
-            let type: ContentType = isURL(string) ? .link : .text
-            return ClipboardItem(
-                content: string,
-                type: type,
-                appSource: appSource
-            )
-        }
-
-        return nil
-    }
-
-    private func readRawImageData() -> Data? {
-        if let data = pasteboard.data(forType: .tiff) {
-            return data
-        }
-        if let data = pasteboard.data(forType: .png) {
-            return data
-        }
-        return nil
-    }
-
-    private func normalizeImageData(_ rawData: Data?) -> Data? {
-        guard let rawData else { return nil }
-        guard let image = NSImage(data: rawData),
-              let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
-            return rawData
-        }
-        return pngData
-    }
-
-    private func isURL(_ string: String) -> Bool {
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed) else { return false }
-        return url.scheme == "http" || url.scheme == "https"
-    }
-
-    private func sha256Hex(_ data: Data) -> String {
-        let digest = SHA256.hash(data: data)
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private var shouldWriteDebugLog: Bool {
-#if DEBUG
-        UserDefaults.standard.bool(forKey: Constants.UserDefaultsKeys.debugLoggingEnabled)
-#else
-        false
-#endif
-    }
-
-    private func appendDebugLog(_ message: String) {
-        guard let data = message.data(using: .utf8) else { return }
-
-        let fileManager = FileManager.default
-        let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-        guard let appSupportURL else { return }
-
-        let dirURL = appSupportURL.appendingPathComponent("ClipMaster", isDirectory: true)
-        let logURL = dirURL.appendingPathComponent("debug.log")
-        let backupURL = dirURL.appendingPathComponent("debug.log.1")
-
-        do {
-            try fileManager.createDirectory(at: dirURL, withIntermediateDirectories: true)
-            if fileManager.fileExists(atPath: logURL.path) {
-                let attributes = try fileManager.attributesOfItem(atPath: logURL.path)
-                let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
-                if size + data.count > Constants.debugLogMaxSizeBytes {
-                    try? fileManager.removeItem(at: backupURL)
-                    try fileManager.moveItem(at: logURL, to: backupURL)
-                }
-            }
-        } catch {
-            return
-        }
-
-        if let handle = FileHandle(forWritingAtPath: logURL.path) {
-            defer { handle.closeFile() }
-            handle.seekToEndOfFile()
-            handle.write(data)
-        } else {
-            try? data.write(to: logURL)
         }
     }
 }

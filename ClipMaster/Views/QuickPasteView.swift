@@ -127,7 +127,7 @@ struct QuickPasteView: View {
                                 }
                                 .contextMenu {
                                     if item.type == .image {
-                                        Button("保存图片") { saveImageToDownloads(item) }
+                                        Button("保存图片") { ImageFileSaver.saveImageToDownloads(item) }
                                     }
                                 }
                             }
@@ -166,39 +166,6 @@ struct QuickPasteView: View {
             } else {
                 proxy.scrollTo(targetID, anchor: .center)
             }
-        }
-    }
-
-    private func saveImageToDownloads(_ item: ClipboardItem) {
-        guard item.type == .image,
-              let data = try? StorageService.shared.fetchImageData(for: item.id) else {
-            ToastService.shared.show(
-                message: "图片数据不存在",
-                systemImage: "xmark.circle.fill",
-                tintColor: .systemRed
-            )
-            return
-        }
-
-        let downloadsURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let filename = "ClipMaster-\(timestamp).png"
-        let fileURL = downloadsURL.appendingPathComponent(filename)
-
-        do {
-            try data.write(to: fileURL)
-            ToastService.shared.show(
-                message: "已保存到 Downloads/\(filename)",
-                systemImage: "checkmark.circle.fill",
-                tintColor: .systemGreen
-            )
-        } catch {
-            AppLogger.ui.error("Save image failed: \(error.localizedDescription, privacy: .public)")
-            ToastService.shared.show(
-                message: "保存失败",
-                systemImage: "xmark.circle.fill",
-                tintColor: .systemRed
-            )
         }
     }
 }
@@ -261,7 +228,7 @@ struct QuickPasteRow: View {
         case .text:  Image(systemName: "doc.text")
         case .image: Image(systemName: "photo")
         case .link:  Image(systemName: "link")
-        case .file:  Image(systemName: "doc")
+        case .file:  Image(systemName: MediaFilePresentation(content: item.content).iconSystemName)
         }
     }
 
@@ -288,18 +255,34 @@ struct QuickPasteRow: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-        case .text, .link, .file:
+        case .file:
+            let presentation = MediaFilePresentation(content: item.content)
+            HStack(spacing: 4) {
+                if let fileURL = presentation.singleImageURL {
+                    ImageThumbnail(fileURL: fileURL, maxHeight: 20)
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                }
+                Text(presentation.displayText)
+            }
+        case .text, .link:
             Text(item.content.replacingOccurrences(of: "\n", with: " "))
         }
     }
 }
 
-/// Loads image thumbnail lazily from cache file
+/// Loads downsampled image thumbnails lazily from persisted image files or local file URLs
 struct ImageThumbnail: View {
     let imagePath: String?
+    let fileURL: URL?
     let maxHeight: CGFloat
     @State private var nsImage: NSImage?
     private let cache = ImageThumbnailCache.shared
+
+    init(imagePath: String? = nil, fileURL: URL? = nil, maxHeight: CGFloat) {
+        self.imagePath = imagePath
+        self.fileURL = fileURL
+        self.maxHeight = maxHeight
+    }
 
     var body: some View {
         Group {
@@ -311,18 +294,44 @@ struct ImageThumbnail: View {
             }
         }
         .onAppear {
-            guard nsImage == nil, let path = imagePath else { return }
-            if let cached = cache.image(forKey: path) {
+            guard nsImage == nil else { return }
+            let cacheKey: String
+            if let imagePath {
+                cacheKey = ImageThumbnailLoader.cacheKey(imagePath: imagePath)
+            } else if let fileURL {
+                cacheKey = ImageThumbnailLoader.cacheKey(fileURL: fileURL)
+            } else {
+                return
+            }
+
+            if let cached = cache.image(forKey: cacheKey) {
                 nsImage = cached
                 return
             }
+
+            let targetPath = imagePath
+            let targetFileURL = fileURL
             DispatchQueue.global(qos: .userInitiated).async {
-                if let data = StorageService.shared.loadImageData(filename: path),
-                   let img = NSImage(data: data) {
-                    DispatchQueue.main.async {
-                        cache.setImage(img, forKey: path)
-                        nsImage = img
+                let thumbnail: NSImage?
+                if let targetPath {
+                    if let url = StorageService.shared.imageFileURL(for: targetPath) {
+                        thumbnail = ImageThumbnailLoader.loadThumbnail(fromFileURL: url)
+                    } else if let data = StorageService.shared.loadImageData(filename: targetPath) {
+                        thumbnail = ImageThumbnailLoader.loadThumbnail(from: data)
+                    } else {
+                        thumbnail = nil
                     }
+                } else if let targetFileURL,
+                          FileManager.default.fileExists(atPath: targetFileURL.path) {
+                    thumbnail = ImageThumbnailLoader.loadThumbnail(fromFileURL: targetFileURL)
+                } else {
+                    thumbnail = nil
+                }
+
+                guard let thumbnail else { return }
+                DispatchQueue.main.async {
+                    cache.setImage(thumbnail, forKey: cacheKey)
+                    nsImage = thumbnail
                 }
             }
         }

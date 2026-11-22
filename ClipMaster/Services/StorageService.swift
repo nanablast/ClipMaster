@@ -25,12 +25,20 @@ final class StorageService {
     private static let ftsDeleteTriggerName = "clipboardItems_ad_fts"
 
     private let imageCacheDir: URL
+    private let legacyImageCacheDir: URL?
+    private let postsDistributedNotifications: Bool
+    private let maxPersistedImageCount: Int
+    private let maxPersistedImageTotalBytes: Int
     private var dbQueue: DatabaseQueue!
     private(set) var mode: Mode = .readWrite
     private(set) var startupWarningMessage: String?
 
     private init() {
         self.imageCacheDir = Self.defaultImageCacheDir()
+        self.legacyImageCacheDir = Self.legacyImageCacheDir()
+        self.postsDistributedNotifications = true
+        self.maxPersistedImageCount = Constants.maxPersistedImageCount
+        self.maxPersistedImageTotalBytes = Constants.maxPersistedImageTotalBytes
         do {
             try setupDatabase()
             mode = .readWrite
@@ -68,8 +76,18 @@ final class StorageService {
         }
     }
 
-    init(databasePath: String, imageCacheDir: URL) throws {
+    init(
+        databasePath: String,
+        imageCacheDir: URL,
+        legacyImageCacheDir: URL? = nil,
+        maxPersistedImageCount: Int = Constants.maxPersistedImageCount,
+        maxPersistedImageTotalBytes: Int = Constants.maxPersistedImageTotalBytes
+    ) throws {
         self.imageCacheDir = imageCacheDir
+        self.legacyImageCacheDir = legacyImageCacheDir
+        self.postsDistributedNotifications = false
+        self.maxPersistedImageCount = maxPersistedImageCount
+        self.maxPersistedImageTotalBytes = maxPersistedImageTotalBytes
         try setupDatabase(atPath: databasePath)
     }
 
@@ -115,6 +133,10 @@ final class StorageService {
     }
 
     private static func defaultImageCacheDir() -> URL {
+        defaultAppDirectory().appendingPathComponent("images", isDirectory: true)
+    }
+
+    private static func legacyImageCacheDir() -> URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         return caches.appendingPathComponent("ClipMaster/images", isDirectory: true)
     }
@@ -326,18 +348,22 @@ final class StorageService {
 
     // MARK: - Image File Management
 
-    /// Save image data to cache directory. Returns the filename.
-    func saveImageFile(_ data: Data, id: UUID) -> String? {
+    /// Save image data to persisted storage directory. Returns the filename.
+    func saveImageFile(_ data: Data, id: UUID, fileExtension: String = "png") -> String? {
         if mode == .readOnly {
             return nil
         }
 
-        let filename = "\(id.uuidString).png"
+        let trimmedExtension = fileExtension
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+            .lowercased()
+        let normalizedExtension = trimmedExtension.isEmpty ? "png" : trimmedExtension
+        let filename = "\(id.uuidString).\(normalizedExtension)"
         let fileURL = imageCacheDir.appendingPathComponent(filename)
 
         do {
             try FileManager.default.createDirectory(at: imageCacheDir, withIntermediateDirectories: true)
-            try data.write(to: fileURL)
+            try data.write(to: fileURL, options: .atomic)
             return filename
         } catch {
             AppLogger.storage.error("Failed to save image file: \(error.localizedDescription, privacy: .public)")
@@ -345,10 +371,33 @@ final class StorageService {
         }
     }
 
-    /// Load image data from cache directory.
+    /// Resolve an existing image file URL in persisted storage (or legacy cache before migration).
+    func imageFileURL(for filename: String) -> URL? {
+        let fileManager = FileManager.default
+        let primaryURL = imageCacheDir.appendingPathComponent(filename)
+        if fileManager.fileExists(atPath: primaryURL.path) {
+            return primaryURL
+        }
+        if let legacyDir = legacyImageCacheDir {
+            let legacyURL = legacyDir.appendingPathComponent(filename)
+            if fileManager.fileExists(atPath: legacyURL.path) {
+                return legacyURL
+            }
+        }
+        return nil
+    }
+
+    /// Load image data from persisted storage directory.
     func loadImageData(filename: String) -> Data? {
         let fileURL = imageCacheDir.appendingPathComponent(filename)
-        return try? Data(contentsOf: fileURL)
+        if let data = try? Data(contentsOf: fileURL) {
+            return data
+        }
+        if let legacyDir = legacyImageCacheDir {
+            let legacyURL = legacyDir.appendingPathComponent(filename)
+            return try? Data(contentsOf: legacyURL)
+        }
+        return nil
     }
 
     /// Load image data by item ID (convenience).
@@ -358,6 +407,72 @@ final class StorageService {
         }
         guard let path = item?.imagePath else { return nil }
         return loadImageData(filename: path)
+    }
+
+    /// Migrate cached images created by earlier versions from Caches to Application Support.
+    func migrateLegacyCachedImagesIfNeeded() {
+        guard mode == .readWrite, let legacyDir = legacyImageCacheDir else { return }
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: legacyDir.path) else { return }
+
+        do {
+            try fileManager.createDirectory(at: imageCacheDir, withIntermediateDirectories: true)
+            let legacyFiles = try fileManager.contentsOfDirectory(
+                at: legacyDir,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+            for sourceURL in legacyFiles {
+                let isRegular = (try? sourceURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+                guard isRegular else { continue }
+                let destURL = imageCacheDir.appendingPathComponent(sourceURL.lastPathComponent)
+                if fileManager.fileExists(atPath: destURL.path) {
+                    try? fileManager.removeItem(at: sourceURL)
+                } else {
+                    try fileManager.moveItem(at: sourceURL, to: destURL)
+                }
+            }
+            if let remaining = try? fileManager.contentsOfDirectory(atPath: legacyDir.path), remaining.isEmpty {
+                try? fileManager.removeItem(at: legacyDir)
+            }
+        } catch {
+            AppLogger.storage.error("Failed to migrate legacy image cache: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Reconcile database image rows with persisted files on disk and enforce storage limits.
+    func reconcileImageStorage(maxCount: Int? = nil, maxTotalBytes: Int? = nil) {
+        guard mode == .readWrite else { return }
+        let resolvedMaxCount = maxCount ?? maxPersistedImageCount
+        let resolvedMaxBytes = maxTotalBytes ?? maxPersistedImageTotalBytes
+
+        do {
+            let survivingPaths = try dbQueue.write { db in
+                try enforcePersistedImageLimits(
+                    in: db,
+                    maxCount: resolvedMaxCount,
+                    maxTotalBytes: resolvedMaxBytes,
+                    pruneMissingFiles: true
+                )
+            }
+
+            let fileManager = FileManager.default
+            guard fileManager.fileExists(atPath: imageCacheDir.path) else { return }
+            let files = try fileManager.contentsOfDirectory(
+                at: imageCacheDir,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+            for fileURL in files {
+                let isRegular = (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+                guard isRegular else { continue }
+                if !survivingPaths.contains(fileURL.lastPathComponent) {
+                    try? fileManager.removeItem(at: fileURL)
+                }
+            }
+        } catch {
+            AppLogger.storage.error("Failed to reconcile image storage: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Delete the entire image cache directory. Called on app launch.
@@ -426,7 +541,22 @@ final class StorageService {
             }
 
             try item.insert(db)
+            if item.type == .image {
+                _ = try enforcePersistedImageLimits(
+                    in: db,
+                    maxCount: maxPersistedImageCount,
+                    maxTotalBytes: maxPersistedImageTotalBytes,
+                    pruneMissingFiles: false
+                )
+            }
             try enforceMaxHistoryCount(in: db)
+        }
+        notifyHistoryDidChange()
+    }
+
+    func fetchItem(id: UUID) throws -> ClipboardItem? {
+        try dbQueue.read { db in
+            try ClipboardItem.fetchOne(db, key: id)
         }
     }
 
@@ -508,6 +638,7 @@ final class StorageService {
         try dbQueue.write { db in
             _ = try item.delete(db)
         }
+        notifyHistoryDidChange()
     }
 
     func deleteAll() throws {
@@ -516,6 +647,17 @@ final class StorageService {
         try dbQueue.write { db in
             _ = try ClipboardItem.deleteAll(db)
         }
+        notifyHistoryDidChange()
+    }
+
+    private func notifyHistoryDidChange() {
+        guard postsDistributedNotifications else { return }
+        DistributedNotificationCenter.default().postNotificationName(
+            Constants.DistributedNotifications.historyDidChange,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
     }
 
     func totalCount() throws -> Int {
@@ -561,9 +703,73 @@ final class StorageService {
         }
     }
 
-    private func removeImageFile(filename: String) {
+    @discardableResult
+    private func enforcePersistedImageLimits(
+        in db: Database,
+        maxCount: Int,
+        maxTotalBytes: Int,
+        pruneMissingFiles: Bool
+    ) throws -> Set<String> {
+        let fileManager = FileManager.default
+        let imageItems = try ClipboardItem
+            .filter(ClipboardItem.Columns.type == ContentType.image.rawValue)
+            .order(ClipboardItem.Columns.createdAt.desc)
+            .fetchAll(db)
+
+        var keptCount = 0
+        var keptBytes = 0
+        var survivingPaths = Set<String>()
+
+        for item in imageItems {
+            guard let path = item.imagePath else {
+                if pruneMissingFiles {
+                    try retireImageItem(item, in: db)
+                }
+                continue
+            }
+
+            let fileURL = imageCacheDir.appendingPathComponent(path)
+            guard fileManager.fileExists(atPath: fileURL.path) else {
+                if pruneMissingFiles {
+                    try retireImageItem(item, in: db)
+                }
+                continue
+            }
+
+            let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if keptCount < maxCount && keptBytes + fileSize <= maxTotalBytes {
+                keptCount += 1
+                keptBytes += fileSize
+                survivingPaths.insert(path)
+            } else {
+                removeImageFile(filename: path)
+                try retireImageItem(item, in: db)
+            }
+        }
+
+        return survivingPaths
+    }
+
+    private func retireImageItem(_ item: ClipboardItem, in db: Database) throws {
+        let trimmed = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != Constants.imagePlaceholderText {
+            var downgraded = item
+            downgraded.type = .text
+            downgraded.imagePath = nil
+            downgraded.imageHash = nil
+            try downgraded.update(db)
+        } else {
+            _ = try item.delete(db)
+        }
+    }
+
+    func removeImageFile(filename: String) {
         let fileURL = imageCacheDir.appendingPathComponent(filename)
         try? FileManager.default.removeItem(at: fileURL)
+        if let legacyDir = legacyImageCacheDir {
+            let legacyURL = legacyDir.appendingPathComponent(filename)
+            try? FileManager.default.removeItem(at: legacyURL)
+        }
     }
 
     private func ensureWritable() throws {

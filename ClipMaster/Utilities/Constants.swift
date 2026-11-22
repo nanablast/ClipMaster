@@ -2,13 +2,23 @@ import AppKit
 import HotKey
 
 enum Constants {
+    enum DistributedNotifications {
+        static let historyDidChange = Notification.Name("com.clipmaster.app.historyDidChange")
+        static let remoteCommand = Notification.Name("com.clipmaster.app.remoteCommand")
+    }
+
     static let defaultMaxHistoryCount = 500
     static let minMaxHistoryCount = 50
     static let maxMaxHistoryCount = 5_000
     static let clipboardPollActiveInterval: TimeInterval = 0.20
-    static let clipboardPollIdleInterval: TimeInterval = 3.00
-    static let clipboardIdleThreshold = 8
+    static let clipboardPollIdleInterval: TimeInterval = 1.00
+    static let clipboardIdleDelay: TimeInterval = 60
     static let clipboardPollLeeway: TimeInterval = 0.05
+    static let clipboardReadAttemptLimit = 5
+    static let clipboardSnapshotCountLimit = 64
+    static let clipboardSnapshotByteLimit = 64 * 1_024 * 1_024
+    static let maxPersistedImageCount = 100
+    static let maxPersistedImageTotalBytes = 300 * 1_024 * 1_024
     static let accessibilityPromptMinInterval: TimeInterval = 24 * 60 * 60
     static let databaseFileName = "ClipMaster.sqlite"
     static let defaultSoundName = "Tink"
@@ -151,5 +161,45 @@ enum Constants {
             modifiers: modifiers,
             fallback: action.defaultKeyCombo
         )
+    }
+}
+
+enum ClipMasterRemoteCommand: Equatable {
+    case toggleQuickPaste
+    case openHistory
+    case togglePasteQueue
+    case screenshotOCR
+    case paste(UUID)
+    case copy(UUID)
+
+    static func parse(_ raw: String) -> ClipMasterRemoteCommand? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed {
+        case "toggleQuickPaste":
+            return .toggleQuickPaste
+        case "openHistory":
+            return .openHistory
+        case "togglePasteQueue":
+            return .togglePasteQueue
+        case "screenshotOCR":
+            return .screenshotOCR
+        default:
+            if let uuidString = trimmed.dropPrefixIfPresent("paste:"),
+               let id = UUID(uuidString: uuidString) {
+                return .paste(id)
+            }
+            if let uuidString = trimmed.dropPrefixIfPresent("copy:"),
+               let id = UUID(uuidString: uuidString) {
+                return .copy(id)
+            }
+            return nil
+        }
+    }
+}
+
+private extension String {
+    func dropPrefixIfPresent(_ prefix: String) -> String? {
+        guard hasPrefix(prefix) else { return nil }
+        return String(dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

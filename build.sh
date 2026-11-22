@@ -30,9 +30,21 @@ done
 # 生成 PkgInfo
 echo -n "APPL????" > "${APP_PATH}/Contents/PkgInfo"
 
-echo "=== 签名应用（ad-hoc）==="
 chmod -R u+w "${APP_PATH}"
-codesign --force --deep --sign - "${APP_PATH}"
+SIGN_IDENTITY="${SIGN_IDENTITY:-}"
+if [ -z "${SIGN_IDENTITY}" ]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk '/Apple Development:/ {print $2; exit}')"
+fi
+if [ -z "${SIGN_IDENTITY}" ]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk '/^[[:space:]]*[0-9]+\)/ {print $2; exit}')"
+fi
+if [ -n "${SIGN_IDENTITY}" ]; then
+    echo "=== 签名应用（稳定证书: ${SIGN_IDENTITY}）==="
+    codesign --force --deep --sign "${SIGN_IDENTITY}" "${APP_PATH}"
+else
+    echo "=== 签名应用（未找到可用代码签名证书，回退 ad-hoc）==="
+    codesign --force --deep --sign - "${APP_PATH}"
+fi
 codesign --verify --deep --strict "${APP_PATH}"
 
 echo "=== 构建完成 ==="

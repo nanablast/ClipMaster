@@ -253,4 +253,96 @@ final class StorageServiceTests: XCTestCase {
         let count = try storage.totalCount()
         XCTAssertEqual(count, Constants.minMaxHistoryCount)
     }
+
+    func testMigrateLegacyCachedImagesMovesFilesAndClearsEmptyLegacyDir() throws {
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ClipMasterMigration-\(UUID().uuidString)", isDirectory: true)
+        let primaryDir = rootDir.appendingPathComponent("primary/images", isDirectory: true)
+        let legacyDir = rootDir.appendingPathComponent("legacy/images", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        let sampleBytes = Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4])
+        try sampleBytes.write(to: legacyDir.appendingPathComponent("legacy-1.png"))
+
+        let storage = try StorageService(
+            databasePath: rootDir.appendingPathComponent("db.sqlite").path,
+            imageCacheDir: primaryDir,
+            legacyImageCacheDir: legacyDir
+        )
+
+        storage.migrateLegacyCachedImagesIfNeeded()
+
+        XCTAssertEqual(storage.loadImageData(filename: "legacy-1.png"), sampleBytes)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: primaryDir.appendingPathComponent("legacy-1.png").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyDir.path))
+    }
+
+    func testPersistedImageLimitsDowngradeOCRAndPruneOverflowOnInsertAndReconcile() throws {
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ClipMasterCap-\(UUID().uuidString)", isDirectory: true)
+        let imageDir = rootDir.appendingPathComponent("images", isDirectory: true)
+        try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        let storage = try StorageService(
+            databasePath: rootDir.appendingPathComponent("db.sqlite").path,
+            imageCacheDir: imageDir,
+            maxPersistedImageCount: 2,
+            maxPersistedImageTotalBytes: 220
+        )
+
+        let id1 = UUID()
+        let path1 = try XCTUnwrap(storage.saveImageFile(Data(repeating: 1, count: 100), id: id1))
+        try storage.insert(ClipboardItem(
+            id: id1,
+            content: "OCR text preserved",
+            type: .image,
+            createdAt: Date(timeIntervalSince1970: 100),
+            imagePath: path1,
+            imageHash: "h1"
+        ))
+
+        let id2 = UUID()
+        let path2 = try XCTUnwrap(storage.saveImageFile(Data(repeating: 2, count: 100), id: id2))
+        try storage.insert(ClipboardItem(
+            id: id2,
+            content: Constants.imagePlaceholderText,
+            type: .image,
+            createdAt: Date(timeIntervalSince1970: 200),
+            imagePath: path2,
+            imageHash: "h2"
+        ))
+
+        // Insert 3rd image (150 bytes): total 150 + 100 = 250 > 220, so only newest (id3) survives bytes cap!
+        let id3 = UUID()
+        let path3 = try XCTUnwrap(storage.saveImageFile(Data(repeating: 3, count: 150), id: id3))
+        try storage.insert(ClipboardItem(
+            id: id3,
+            content: Constants.imagePlaceholderText,
+            type: .image,
+            createdAt: Date(timeIntervalSince1970: 300),
+            imagePath: path3,
+            imageHash: "h3"
+        ))
+
+        let allAfterInsert = try storage.fetchAll()
+        // id1 carried OCR text so it downgraded to .text; id2 had placeholder so it was deleted; id3 survived.
+        XCTAssertEqual(allAfterInsert.count, 2)
+        let keptImage = try XCTUnwrap(allAfterInsert.first(where: { $0.id == id3 }))
+        XCTAssertEqual(keptImage.type, .image)
+        let downgradedOCR = try XCTUnwrap(allAfterInsert.first(where: { $0.id == id1 }))
+        XCTAssertEqual(downgradedOCR.type, .text)
+        XCTAssertNil(downgradedOCR.imagePath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: imageDir.appendingPathComponent(path1).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: imageDir.appendingPathComponent(path2).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: imageDir.appendingPathComponent(path3).path))
+
+        // Drop an orphan file into imageDir and ensure reconcileImageStorage removes it.
+        let orphanURL = imageDir.appendingPathComponent("orphan.png")
+        try Data([9, 9, 9]).write(to: orphanURL)
+        storage.reconcileImageStorage()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: imageDir.appendingPathComponent(path3).path))
+    }
 }

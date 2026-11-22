@@ -55,4 +55,19 @@ final class ConstantsTests: XCTestCase {
             expected
         )
     }
+
+    func testRemoteCommandParseValidAndInvalidInputs() {
+        let id = UUID()
+        XCTAssertEqual(ClipMasterRemoteCommand.parse("toggleQuickPaste"), .toggleQuickPaste)
+        XCTAssertEqual(ClipMasterRemoteCommand.parse(" openHistory \n"), .openHistory)
+        XCTAssertEqual(ClipMasterRemoteCommand.parse("togglePasteQueue"), .togglePasteQueue)
+        XCTAssertEqual(ClipMasterRemoteCommand.parse("screenshotOCR"), .screenshotOCR)
+        XCTAssertEqual(ClipMasterRemoteCommand.parse("paste:\(id.uuidString)"), .paste(id))
+        XCTAssertEqual(ClipMasterRemoteCommand.parse("copy: \(id.uuidString.lowercased()) "), .copy(id))
+
+        XCTAssertNil(ClipMasterRemoteCommand.parse(""))
+        XCTAssertNil(ClipMasterRemoteCommand.parse("unknown"))
+        XCTAssertNil(ClipMasterRemoteCommand.parse("paste:not-a-uuid"))
+        XCTAssertNil(ClipMasterRemoteCommand.parse("copy:"))
+    }
 }

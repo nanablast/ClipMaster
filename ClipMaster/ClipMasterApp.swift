@@ -15,10 +15,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var settingsWindow: NSWindow?
-    private let clipboardMonitor = ClipboardMonitor()
+    private let clipboardMonitor = ClipboardMonitor(
+        onOversizedCopy: {
+            ToastService.shared.show(
+                message: "内容超过 64 MB，已跳过保存",
+                systemImage: "exclamationmark.triangle.fill",
+                tintColor: .systemOrange
+            )
+        }
+    )
     private let hotKeyManager = HotKeyManager.shared
     private let pasteQueue = PasteQueue.shared
     private let floatingPanelController = FloatingPanelController.shared
+    private var remoteCommandObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -26,14 +35,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         requestAccessibilityPermissionIfNeeded()
 
-        // Clear image cache from previous session
-        StorageService.shared.clearImageCache()
-        StorageService.shared.expireSessionImages()
+        // Migrate legacy cached images to persistent storage and prune excess files
+        StorageService.shared.migrateLegacyCachedImagesIfNeeded()
+        StorageService.shared.reconcileImageStorage()
         ImageThumbnailCache.shared.removeAll()
 
         setupStatusItem()
         setupPopover()
         setupHotKey()
+        setupRemoteCommandObserver()
         pasteQueue.onStateChanged = { [weak self] isActive in
             self?.updateStatusIcon(queueActive: isActive)
         }
@@ -59,6 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let observer = remoteCommandObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+            remoteCommandObserver = nil
+        }
         clipboardMonitor.stop()
         hotKeyManager.unregister()
         pasteQueue.stop()
@@ -226,5 +240,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         SystemPermissionService.requestAccessibilityPrompt()
         defaults.set(now, forKey: key)
+    }
+
+    // MARK: - Distributed IPC (Pier Integration)
+
+    private func setupRemoteCommandObserver() {
+        remoteCommandObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Constants.DistributedNotifications.remoteCommand,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let raw = notification.object as? String,
+                  let command = ClipMasterRemoteCommand.parse(raw) else {
+                return
+            }
+            self?.handleRemoteCommand(command)
+        }
+    }
+
+    private func handleRemoteCommand(_ command: ClipMasterRemoteCommand) {
+        switch command {
+        case .toggleQuickPaste:
+            toggleQuickPaste()
+        case .openHistory:
+            showPopover()
+        case .togglePasteQueue:
+            activatePasteQueue()
+        case .screenshotOCR:
+            ScreenshotOCRService.captureAndOCR()
+        case .paste(let id):
+            if let item = try? StorageService.shared.fetchItem(id: id) {
+                PasteService.paste(item)
+            } else {
+                NSSound.beep()
+            }
+        case .copy(let id):
+            if let item = try? StorageService.shared.fetchItem(id: id) {
+                PasteService.writeToPasteboard(item)
+            } else {
+                NSSound.beep()
+            }
+        }
     }
 }
