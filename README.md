@@ -1,110 +1,129 @@
+<div align="center">
+
 # ClipMaster
 
-ClipMaster 是一个 macOS 菜单栏剪贴板管理器，定位类似 CleanClip。  
-基于 Swift / SwiftUI / SPM，支持文本、链接、文件、图片与 OCR 工作流。
+**A fast, lightweight native macOS menu-bar clipboard manager built with Swift & SwiftUI.**
 
-## 功能特性
+[![Platform: macOS 13+](https://img.shields.io/badge/macOS-13%2B-0A84FF?style=flat-square&logo=apple&logoColor=white)](https://www.apple.com/macos/)
+[![Swift 5.9](https://img.shields.io/badge/Swift-5.9-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-34C759?style=flat-square)](LICENSE)
 
-- 菜单栏常驻（`LSUIElement=true`，无 Dock 图标）
-- 剪贴板历史记录（文本 / 链接 / 文件 / 图片）
-- 图片 OCR：
-  - 复制图片自动 OCR
-  - `⌘⇧O` 截图区域 OCR
-- 快速粘贴面板（`⌘;`，不抢前台焦点）
-- 粘贴队列模式（`⌘'`）
-- 搜索过滤、分页加载、去重与历史上限
-- 开机启动、提示音、自定义设置
+English | [简体中文](README.zh-CN.md)
 
-## 系统要求
+<br />
 
-- macOS 13.0 及以上
-- Xcode Command Line Tools（用于 `swift build`）
+<img src="docs/media/quick-paste.png" alt="ClipMaster Quick Paste Panel" width="840" />
 
-## 快速开始
+</div>
+
+---
+
+## Live Demo
+
+<div align="center">
+  <img src="docs/media/demo.gif" alt="ClipMaster Live Workflow Demo" width="800" />
+  <br />
+  <sub>
+    Prefer full resolution? <a href="docs/media/demo.mp4">Watch full 1280×800 H.264 video (demo.mp4)</a>
+  </sub>
+</div>
+
+---
+
+## Features
+
+- **Zero-Focus Quick Paste (`⌘;`)**: Non-activating `NSPanel` floats right over your current editor without ever stealing keyboard focus. Browse and paste back to the previous app seamlessly.
+- **Type-to-Search Filtering**: Start typing immediately inside Quick Paste to filter history in real time by content or source app, with `ESC` to clear.
+- **Paste Queue Mode (`⌘'`)**: Queue copied snippets sequentially (capped at 64 items / 64 MiB) and paste them in FIFO order one after another.
+- **Screenshot Region OCR (`⌘⇧O`)**: Drag to capture any screen region and extract text via multi-pass Apple Vision OCR (CJK, Japanese, and English) directly to the clipboard and history.
+- **Rich Formats, Persistent Images & GIF Preservation**: Tracks text, links, files, and images; stores persistent image assets on disk (up to 100 items / 300 MB) and preserves animated GIF frames as well as dual-format paste replay.
+- **Menu Bar Minimalist UI & Low Idle Overhead**: Runs with `LSUIElement=true` (no Dock icon), adaptive polling (`200ms` active / `1s` idle), configurable sound feedback, customizable hotkeys, and **50–5,000** persisted SQLite history items.
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/media/quick-search.png" alt="ClipMaster Instant Search Filtering" width="100%" />
+      <br />
+      <sub><strong>Instant Keyboard Filtering</strong> — Start typing inside the Quick Paste panel to narrow down snippets immediately.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/media/settings.png" alt="ClipMaster Preferences Window" width="100%" />
+      <br />
+      <sub><strong>Preferences & Global Shortcuts</strong> — Customize global hotkeys, history retention limits, launch at login, and permissions.</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `⌘;` | Toggle Quick Paste floating panel (zero-focus) |
+| `⌘'` | Toggle FIFO Paste Queue mode (up to 64 items / 64 MiB) |
+| `⌘⇧O` | Trigger Screenshot Region OCR |
+| `⏎` | Paste selected item (pastes image data for image items) |
+| `⇧⏎` | Paste as plain text / OCR extracted text |
+| `0` – `9` | Instant select & paste item by visible index |
+| `⌘⌫` | Delete selected item from history |
+| Type characters directly | Filter clipboard history live inside `⌘;` Quick Paste |
+
+---
+
+## Build, Test & Deploy
+
+### Requirements
+- macOS 13.0+ (Ventura or later)
+- Swift 5.9+ toolchain (SPM dependencies: `GRDB.swift` 6.24+, `HotKey` 0.2+, `LaunchAtLogin-Modern` 1.1+)
+
+### Commands
 
 ```bash
-# 1) Debug 构建
+# Run unit tests
+swift test
+
+# Debug build
 swift build
 
-# 2) Release 构建 + 打包 .app
+# Release build + .app bundle packaging
 bash build.sh
 
-# 3) 部署（会重置辅助功能与录屏权限）
+# Build & deploy locally (resets Accessibility TCC permission cleanly)
 bash deploy.sh
 
-# 或一条命令：测试 + 构建 + 部署
+# All-in-one: test + release build + deploy
 bash release-check.sh
 ```
 
-## 权限说明
+### Permissions & Gatekeeper Troubleshooting
 
-ClipMaster 涉及以下系统权限：
-
-- 辅助功能（用于全局快捷键/模拟粘贴等）
-- 录屏权限（用于截图 OCR）
-
-重新编译后签名变化可能导致权限失效，可执行：
+ClipMaster uses Accessibility to replay `⌘V` and Screen Recording for `⌘⇧O` Screenshot OCR. If a re-signed build triggers stale macOS TCC state:
 
 ```bash
 tccutil reset Accessibility com.clipmaster.app
 tccutil reset ScreenCapture com.clipmaster.app
 ```
 
-然后在「系统设置 → 隐私与安全性」中重新授权。
-
-## 下载版无法打开（“已损坏”）排查
-
-如果从浏览器下载 Release 后出现“`ClipMaster.app` 已损坏，无法打开”，通常是 macOS 隔离属性触发。
-
-执行：
+If launching an unsigned local build triggers macOS Gatekeeper quarantine:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/ClipMaster.app
-open /Applications/ClipMaster.app
 ```
 
-## 数据与日志
+> **Storage & Logs:**
+> - SQLite database: `~/Library/Application Support/ClipMaster/ClipMaster.sqlite`
+> - Debug logs: `~/Library/Application Support/ClipMaster/debug.log`
 
-- 数据库：`~/Library/Application Support/ClipMaster/ClipMaster.sqlite`
-- 调试日志：`~/Library/Application Support/ClipMaster/debug.log`
+---
 
-## 快捷键
+## Project Links
 
-| 快捷键 | 功能 |
-|--------|------|
-| `⌘;` | 快速粘贴面板（不失焦） |
-| `⌘'` | 粘贴队列模式 |
-| `⌘⇧O` | 截图区域 OCR |
-| `⏎` | 粘贴选中项（图片类型粘贴图片） |
-| `⇧⏎` | 粘贴为纯文本 / OCR 文字 |
-| `0-9` | 快速选择粘贴 |
-| `⌘⌫` | 删除选中项 |
-| 直接打字 | 搜索过滤（`⌘;` 面板中） |
-
-## 开发
-
-```bash
-# 运行测试
-swift test
-
-# Debug 构建
-swift build
-
-# Release 构建
-bash build.sh
-```
-
-## 贡献
-
-欢迎 Issue 与 PR。请先阅读：
-
-- [CONTRIBUTING.md](./CONTRIBUTING.md)
-- [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
-
-## 变更记录
-
-见 [CHANGELOG.md](./CHANGELOG.md)。
-
-## 许可证
-
-[MIT](./LICENSE)
+- [CHANGELOG](CHANGELOG.md)
+- [Contributing Guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [MIT License](LICENSE)
